@@ -1,0 +1,89 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helper Functions ─────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isProfessor() {
+      return isAuthenticated() && getUserRole() == 'professor';
+    }
+
+    function isStudent() {
+      return isAuthenticated() && getUserRole() == 'student';
+    }
+
+    // ─── Users Collection ─────────────────────────────────────────
+    // Users can only read/write their own document.
+    // Role is set at registration and cannot be changed.
+    match /users/{userId} {
+      allow read: if isAuthenticated() && isOwner(userId);
+      allow create: if isAuthenticated() && isOwner(userId)
+                    && request.resource.data.keys().hasAll(['email', 'name', 'role', 'createdAt'])
+                    && request.resource.data.role in ['professor', 'student'];
+      allow update: if isAuthenticated() && isOwner(userId)
+                    && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']);
+      allow delete: if false;
+    }
+
+    // ─── Courses Collection ───────────────────────────────────────
+    // Only professors can create courses (and only as their own).
+    // Anyone authenticated can read courses (students need to find them by code).
+    match /courses/{courseId} {
+      allow read: if isAuthenticated();
+      allow create: if isProfessor()
+                    && request.resource.data.professorId == request.auth.uid
+                    && request.resource.data.keys().hasAll(['name', 'code', 'professorId', 'createdAt']);
+      allow update: if isProfessor()
+                    && resource.data.professorId == request.auth.uid;
+      allow delete: if isProfessor()
+                    && resource.data.professorId == request.auth.uid;
+
+      // ─── Enrollments Subcollection ────────────────────────────
+      // Students can enroll themselves. Professors who own the course can read.
+      match /enrollments/{studentId} {
+        allow read: if isAuthenticated()
+                    && (isOwner(studentId) || resource == null || get(/databases/$(database)/documents/courses/$(courseId)).data.professorId == request.auth.uid);
+        allow create: if isStudent() && isOwner(studentId)
+                      && request.resource.data.keys().hasAll(['studentName', 'enrolledAt']);
+        allow update, delete: if false;
+      }
+    }
+
+    // ─── Sessions Collection ──────────────────────────────────────
+    // Only the owning professor can create/manage sessions.
+    // Students can read active sessions (to validate QR scans).
+    match /sessions/{sessionId} {
+      allow read: if isAuthenticated();
+      allow create: if isProfessor()
+                    && request.resource.data.professorId == request.auth.uid
+                    && request.resource.data.keys().hasAll(['courseId', 'professorId', 'token', 'startedAt', 'expiresAt', 'isActive']);
+      allow update: if isProfessor()
+                    && resource.data.professorId == request.auth.uid;
+      allow delete: if false;
+
+      // ─── Attendance Subcollection ─────────────────────────────
+      // Students can mark their own attendance (once per session).
+      // Professor who owns the session can read all attendance records.
+      match /attendance/{studentId} {
+        allow read: if isAuthenticated()
+                    && (isOwner(studentId) || get(/databases/$(database)/documents/sessions/$(sessionId)).data.professorId == request.auth.uid);
+        allow create: if isStudent() && isOwner(studentId)
+                      && request.resource.data.keys().hasAll(['studentName', 'scannedAt'])
+                      && get(/databases/$(database)/documents/sessions/$(sessionId)).data.isActive == true;
+        allow update, delete: if false;
+      }
+    }
+  }
+}
